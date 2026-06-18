@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DOORS — an infinite dream-house</title>
+<style>
+  :root { --ink:#e9e4d8; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:#000; overflow:hidden; color:var(--ink);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; cursor:default; }
+  canvas { display:block; }
+
+  /* film grain + vignette overlay for dream mood */
+  #grain, #vignette { position:fixed; inset:0; pointer-events:none; z-index:5; }
+  #vignette { box-shadow: inset 0 0 220px 60px rgba(0,0,0,0.75); }
+  #grain { opacity:0.05; mix-blend-mode:overlay; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+  /* fade-to-black used during room transitions */
+  #fade { position:fixed; inset:0; background:#000; opacity:0; z-index:8;
+    transition: opacity .55s ease; pointer-events:none; }
+  #fade.on { opacity:1; }
+
+  /* HUD */
+  #hud { position:fixed; left:18px; bottom:16px; z-index:6; font-size:12px;
+    letter-spacing:.12em; text-transform:uppercase; opacity:.55; pointer-events:none;
+    text-shadow:0 1px 8px #000; }
+  #hud b { font-weight:600; opacity:.95; }
+  #hint { position:fixed; left:50%; bottom:46px; transform:translateX(-50%); z-index:6;
+    font-size:12px; letter-spacing:.18em; text-transform:uppercase; opacity:0;
+    transition:opacity 1.2s ease; pointer-events:none; text-shadow:0 1px 8px #000; }
+
+  /* start / pause overlay */
+  #gate { position:fixed; inset:0; z-index:10; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:26px; text-align:center;
+    background:radial-gradient(circle at 50% 40%, #14101c 0%, #050407 70%); cursor:pointer; }
+  #gate.hidden { display:none; }
+  #title { font-family: "Times New Roman", Georgia, serif; font-weight:400;
+    font-size: clamp(56px, 16vw, 168px); letter-spacing:.22em; margin-left:.22em;
+    line-height:1; color:#f3ecdd; text-shadow:0 0 40px rgba(180,150,255,.35); }
+  #sub { max-width:30ch; font-size:13px; line-height:1.9; letter-spacing:.16em;
+    text-transform:uppercase; opacity:.6; }
+  #enter { font-size:12px; letter-spacing:.34em; text-transform:uppercase;
+    border:1px solid rgba(233,228,216,.35); padding:14px 30px; opacity:.85;
+    animation:breathe 3.4s ease-in-out infinite; }
+  @keyframes breathe { 0%,100%{opacity:.45} 50%{opacity:.95} }
+  #keys { font-size:11px; letter-spacing:.2em; opacity:.4; text-transform:uppercase; }
+  #err { position:fixed; inset:0; z-index:20; display:none; align-items:center;
+    justify-content:center; background:#000; padding:40px; text-align:center;
+    font-size:14px; line-height:1.8; }
+</style>
+</head>
+<body>
+  <div id="fade"></div>
+  <div id="vignette"></div>
+  <div id="grain"></div>
+
+  <div id="hud">Room <b id="depth">000</b><br><span id="palname">—</span></div>
+  <div id="hint">walk through any door</div>
+
+  <div id="gate">
+    <div id="title">DOORS</div>
+    <div id="sub">An infinite, self-generating dream-house.<br>Every room unique. There is no end.</div>
+    <div id="enter">▸ click to enter ◂</div>
+    <div id="keys">W A S D / arrows — move · mouse — look · esc — wake</div>
+  </div>
+
+  <div id="err"></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+/* =====================================================================
+   DOORS — infinite procedural dream-house  (Three.js / WebGL)
+   ---------------------------------------------------------------------
+   - Each room is built from a seed. Walk through a doorway and the world
+     fades, re-seeds, and rebuilds: the illusion of endless rooms.
+   - Procedural by default (instant, offline). Framed wall "paintings"
+     are generated on a <canvas>. If you wire up an image endpoint via
+     window.DOORS_CONFIG.imageEndpoint, they stream in real dream images
+     and gracefully fall back to procedural art on failure. (See README.)
+   ===================================================================== */
+
+const CFG = window.DOORS_CONFIG || {};   // optional AI-accent config
+
+// ---- seeded RNG (mulberry32) ---------------------------------------
+function rngFrom(seed){
+  let a = seed >>> 0;
+  return function(){
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const hashStr = s => { let h=2166136261; for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);} return h>>>0; };
+
+// ---- renderer / scene ----------------------------------------------
+let renderer, scene, camera, controls, clock;
+let roomGroup = null, ROOM = null, depth = 0;
+let seed = (Date.now ? 0 : 0); // Date.now blocked in some envs; seed set on start
+
+function fail(msg){ const e=document.getElementById('err'); e.style.display='flex'; e.innerHTML=msg; }
+
+try {
+  renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+} catch(e){ fail('WebGL is unavailable in this browser.<br>Try Chrome, Edge or Firefox.'); }
+
+if (renderer){
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
+  document.body.appendChild(renderer.domElement);
+
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(72, innerWidth/innerHeight, 0.1, 200);
+  camera.position.set(0, 1.6, 0);
+  scene.add(camera);
+
+  controls = new PointerLockControls(camera, renderer.domElement);
+  clock = new THREE.Clock();
+
+  addEventListener('resize', ()=>{
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+}
+
+// ---- input ----------------------------------------------------------
+const keys = {};
+addEventListener('keydown', e=>{ keys[e.code]=true; });
+addEventListener('keyup',   e=>{ keys[e.code]=false; });
+
+const gate = document.getElementById('gate');
+const hint = document.getElementById('hint');
+gate.addEventListener('click', ()=>{ if(renderer) startOrResume(); });
+controls && controls.addEventListener('lock',   ()=> gate.classList.add('hidden'));
+controls && controls.addEventListener('unlock', ()=> gate.classList.remove('hidden'));
+
+let started = false;
+function startOrResume(){
+  if(!started){
+    started = true;
+    seed = hashStr('doors-' + performance.now());
+    initAudio();
+    buildRoom(seed);
+    animate();
+    setTimeout(()=>{ hint.style.opacity = .7;
+      setTimeout(()=> hint.style.opacity = 0, 4200); }, 900);
+  }
+  controls.lock();
+  resumeAudio();
+}
+
+// ---- palette generation --------------------------------------------
+const ADJ = ['hollow','pale','endless','soft','drowned','velvet','quiet','burning','glass','sunken','humming','folded','warm','cold','distant','tender'];
+const NOUN = ['hallway','atrium','nursery','chamber','garden','vestibule','parlor','cistern','gallery','solarium','attic','vault','corridor','ballroom'];
+
+function makePalette(rng){
+  const h = rng()*360;
+  const bright = rng() < 0.32;            // some rooms are pale/foggy-white dreams
+  const compl = (h + (rng()<.5 ? 180 : 90 + rng()*60)) % 360;
+  const C = (hh,s,l)=> new THREE.Color().setHSL(((hh%360)+360)%360/360, s/100, l/100);
+  const pal = bright ? {
+    floor: C(h, 18, 62), wall: C(h, 14, 78), ceil: C(h, 12, 84),
+    accent: C(compl, 70, 60), light: C(h, 30, 85),
+    fog: C(h, 18, 80), fogDensity: 0.045 + rng()*0.03,
+  } : {
+    floor: C(h, 26, 16), wall: C(h, 30, 26), ceil: C(h, 22, 12),
+    accent: C(compl, 82, 60), light: C(compl, 70, 55),
+    fog: C(h, 42, 7), fogDensity: 0.04 + rng()*0.05,
+  };
+  pal.bright = bright;
+  pal.name = ADJ[(rng()*ADJ.length)|0] + ' ' + NOUN[(rng()*NOUN.length)|0];
+  return pal;
+}
+
+// ---- texture helpers ------------------------------------------------
+function gridTexture(color, line, size=512){
+  const c = document.createElement('canvas'); c.width=c.height=size;
+  const x = c.getContext('2d');
+  x.fillStyle = '#'+color.getHexString(); x.fillRect(0,0,size,size);
+  x.strokeStyle = '#'+line.getHexString(); x.globalAlpha=.5; x.lineWidth=2;
+  const n=8, s=size/n;
+  for(let i=0;i<=n;i++){ x.beginPath(); x.moveTo(i*s,0); x.lineTo(i*s,size); x.stroke();
+    x.beginPath(); x.moveTo(0,i*s); x.lineTo(size,i*s); x.stroke(); }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS=t.wrapT=THREE.RepeatWrapping; t.colorSpace=THREE.SRGBColorSpace;
+  return t;
+}
+
+// procedural generative "painting" — abstract dream imagery
+function paintingTexture(rng, pal){
+  const S=512, c=document.createElement('canvas'); c.width=c.height=S;
+  const x=c.getContext('2d');
+  const hx = a => '#'+a.getHexString();
+  // ground
+  const g = x.createLinearGradient(0,0,0,S);
+  g.addColorStop(0, hx(pal.accent)); g.addColorStop(1, hx(pal.bright?pal.wall:pal.ceil));
+  x.fillStyle=g; x.fillRect(0,0,S,S);
+  const mode = (rng()*4)|0;
+  x.globalCompositeOperation = 'screen';
+  if(mode===0){ // orbs
+    for(let i=0;i<40;i++){ const r=10+rng()*120;
+      const rg=x.createRadialGradient(rng()*S,rng()*S,0,0,0,r);
+      x.globalAlpha=.5; x.fillStyle = hx(rng()<.5?pal.accent:pal.light);
+      x.beginPath(); x.arc(rng()*S,rng()*S,r,0,7); x.fill(); }
+  } else if(mode===1){ // strata
+    for(let i=0;i<26;i++){ x.globalAlpha=.18+rng()*.3;
+      x.fillStyle=hx(rng()<.5?pal.light:pal.accent);
+      const y=rng()*S, h=4+rng()*40; x.fillRect(0,y,S,h); }
+  } else if(mode===2){ // radial spokes
+    x.translate(S/2,S/2); const n=12+((rng()*24)|0);
+    for(let i=0;i<n;i++){ x.rotate((Math.PI*2)/n); x.globalAlpha=.25+rng()*.4;
+      x.fillStyle=hx(rng()<.5?pal.accent:pal.light);
+      x.fillRect(0,-6,S*(.3+rng()*.5),12); }
+    x.setTransform(1,0,0,1,0,0);
+  } else { // scatter glyphs
+    for(let i=0;i<160;i++){ x.globalAlpha=.3+rng()*.5;
+      x.fillStyle=hx(rng()<.5?pal.light:pal.accent);
+      const s=2+rng()*16; x.fillRect(rng()*S,rng()*S,s,s); }
+  }
+  const t=new THREE.CanvasTexture(c); t.colorSpace=THREE.SRGBColorSpace; return t;
+}
+
+// optional: stream a real AI dream-image onto a painting material
+async function tryDreamImage(material, prompt, sd){
+  if(!CFG.imageEndpoint) return;
+  try{
+    const url = CFG.imageEndpoint.replace('{prompt}', encodeURIComponent(prompt)).replace('{seed}', sd);
+    const tex = await new THREE.TextureLoader().loadAsync(url);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    material.map = tex; material.emissiveMap = tex; material.needsUpdate = true;
+  } catch(_){ /* keep procedural fallback */ }
+}
+
+// ---- room construction ---------------------------------------------
+const DOOR_W = 2.4, DOOR_H = 3.0;
+
+function disposeGroup(g){
+  g.traverse(o=>{
+    if(o.geometry) o.geometry.dispose();
+    if(o.material){ const m=[].concat(o.material);
+      m.forEach(mm=>{ ['map','emissiveMap'].forEach(k=>mm[k]&&mm[k].dispose()); mm.dispose(); }); }
+  });
+  scene.remove(g);
+}
+
+function buildRoom(sd){
+  const rng = rngFrom(sd);
+  if(roomGroup) disposeGroup(roomGroup);
+  roomGroup = new THREE.Group(); scene.add(roomGroup);
+
+  const pal = makePalette(rng);
+  const W = 10 + rng()*10;          // x extent (full width)
+  const D = 10 + rng()*10;          // z extent (full depth)
+  const H = 3.6 + rng()*2.6;        // height
+  const halfW = W/2, halfD = D/2;
+
+  // fog / background
+  scene.fog = new THREE.FogExp2(pal.fog.getHex(), pal.fogDensity);
+  renderer.setClearColor(pal.fog.getHex());
+
+  // doors: always one on the far (-z) wall; sometimes side doors. Never on +z (entry).
+  const walls = ['-z','+x','-x'];
+  const doors = [{ wall:'-z', center: (rng()-.5)*(W-DOOR_W-2) }];
+  walls.slice(1).forEach(w=>{ if(rng()<0.55) doors.push({ wall:w, center:(rng()-.5)*(D-DOOR_W-2) }); });
+
+  // ---- floor & ceiling
+  const floorMat = new THREE.MeshStandardMaterial({
+    map: gridTexture(pal.floor, pal.accent), roughness:.92, metalness:.05 });
+  floorMat.map.repeat.set(W/4, D/4);
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(W, D), floorMat);
+  floor.rotation.x = -Math.PI/2; roomGroup.add(floor);
+
+  const ceil = new THREE.Mesh(new THREE.PlaneGeometry(W, D),
+    new THREE.MeshStandardMaterial({ color:pal.ceil, roughness:1 }));
+  ceil.rotation.x = Math.PI/2; ceil.position.y = H; roomGroup.add(ceil);
+
+  // ---- walls (built as segments around door gaps)
+  const wallMat = new THREE.MeshStandardMaterial({ color:pal.wall, roughness:.95 });
+  function addWall(wall){
+    const along = (wall==='+z'||wall==='-z') ? W : D;     // span length
+    const door = doors.find(d=>d.wall===wall);
+    const segs = [];
+    if(!door){ segs.push([-along/2, along/2]); }
+    else {
+      const a = door.center - DOOR_W/2, b = door.center + DOOR_W/2;
+      segs.push([-along/2, a]); segs.push([b, along/2]);
+      // lintel above the doorway
+      addLintel(wall, door.center, H);
+    }
+    segs.forEach(([s,e])=>{
+      const len = e - s; if(len <= 0.01) return;
+      const geo = new THREE.BoxGeometry(len, H, 0.3);
+      const m = new THREE.Mesh(geo, wallMat); m.position.y = H/2;
+      const c = s + len/2;
+      if(wall==='-z'){ m.position.set(c, H/2, -halfD); }
+      if(wall==='+z'){ m.position.set(c, H/2,  halfD); }
+      if(wall==='-x'){ m.rotation.y=Math.PI/2; m.position.set(-halfW, H/2, c); }
+      if(wall==='+x'){ m.rotation.y=Math.PI/2; m.position.set( halfW, H/2, c); }
+      roomGroup.add(m);
+    });
+  }
+  function addLintel(wall, center, h){
+    const geo = new THREE.BoxGeometry(DOOR_W+0.4, h-DOOR_H, 0.34);
+    const m = new THREE.Mesh(geo, wallMat); const y = DOOR_H + (h-DOOR_H)/2;
+    if(wall==='-z') m.position.set(center, y, -halfD);
+    if(wall==='+z') m.position.set(center, y,  halfD);
+    if(wall==='-x'){ m.rotation.y=Math.PI/2; m.position.set(-halfW, y, center); }
+    if(wall==='+x'){ m.rotation.y=Math.PI/2; m.position.set( halfW, y, center); }
+    roomGroup.add(m);
+  }
+  ['+z','-z','+x','-x'].forEach(addWall);
+
+  // ---- glowing portal planes inside each doorway
+  doors.forEach(d=>{
+    const mat = new THREE.MeshBasicMaterial({ color:pal.accent, transparent:true,
+      opacity:0.22, side:THREE.DoubleSide, depthWrite:false });
+    const p = new THREE.Mesh(new THREE.PlaneGeometry(DOOR_W, DOOR_H), mat);
+    p.position.y = DOOR_H/2;
+    if(d.wall==='-z'){ p.position.set(d.center, DOOR_H/2, -halfD+0.02); }
+    if(d.wall==='-x'){ p.rotation.y=Math.PI/2; p.position.set(-halfW+0.02, DOOR_H/2, d.center); }
+    if(d.wall==='+x'){ p.rotation.y=Math.PI/2; p.position.set( halfW-0.02, DOOR_H/2, d.center); }
+    p.userData.portal = true; roomGroup.add(p);
+  });
+
+  // ---- wall paintings (procedural; AI-accent if configured)
+  const nArt = 2 + ((rng()*3)|0);
+  for(let i=0;i<nArt;i++){
+    const tex = paintingTexture(rng, pal);
+    const aw = 1.4 + rng()*1.6, ah = aw*(0.7+rng()*0.8);
+    const mat = new THREE.MeshStandardMaterial({ map:tex, emissive:0xffffff,
+      emissiveMap:tex, emissiveIntensity:0.35, roughness:.6 });
+    const art = new THREE.Mesh(new THREE.PlaneGeometry(aw, ah), mat);
+    // frame
+    const frame = new THREE.Mesh(new THREE.PlaneGeometry(aw+0.16, ah+0.16),
+      new THREE.MeshStandardMaterial({ color:pal.accent, emissive:pal.accent, emissiveIntensity:.4 }));
+    const grp = new THREE.Group(); frame.position.z=-0.02; grp.add(frame, art);
+    // place on +z (entry) wall or a wall without a door, at random offset
+    const side = rng();
+    const y = 1.4 + rng()*0.8;
+    if(side<0.5){ grp.position.set((rng()-.5)*(W-3), y, halfD-0.16); grp.rotation.y=Math.PI; }
+    else if(side<0.75){ grp.position.set(-halfW+0.16, y, (rng()-.5)*(D-3)); grp.rotation.y=Math.PI/2; }
+    else { grp.position.set(halfW-0.16, y, (rng()-.5)*(D-3)); grp.rotation.y=-Math.PI/2; }
+    roomGroup.add(grp);
+    tryDreamImage(mat, pal.name + ', surreal dream interior, ' + i, sd + i);
+  }
+
+  // ---- floating dream objects
+  const shapes = [
+    ()=> new THREE.IcosahedronGeometry(0.6+Math.random()*0.6, 0),
+    ()=> new THREE.TorusGeometry(0.6, 0.18, 12, 40),
+    ()=> new THREE.OctahedronGeometry(0.7),
+    ()=> new THREE.TorusKnotGeometry(0.45,0.14,80,12),
+    ()=> new THREE.ConeGeometry(0.6,1.1,5),
+  ];
+  const nObj = 2 + ((rng()*4)|0);
+  for(let i=0;i<nObj;i++){
+    const geo = shapes[(rng()*shapes.length)|0]();
+    const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+      color:pal.accent, emissive:pal.accent, emissiveIntensity:.5,
+      roughness:.3, metalness:.4, flatShading:rng()<.5 }));
+    m.position.set((rng()-.5)*(W-3), 1 + rng()*(H-2), (rng()-.5)*(D-3));
+    m.userData.spin = new THREE.Vector3(rng()*.6, rng()*.6, rng()*.4);
+    m.userData.bob = { base:m.position.y, amp:0.2+rng()*0.5, ph:rng()*7 };
+    roomGroup.add(m);
+  }
+
+  // ---- lighting
+  const hemi = new THREE.HemisphereLight(pal.light.getHex(), pal.floor.getHex(), pal.bright?0.9:0.5);
+  roomGroup.add(hemi);
+  const p1 = new THREE.PointLight(pal.light.getHex(), pal.bright?12:22, 0, 2);
+  p1.position.set((rng()-.5)*W*.4, H-0.6, (rng()-.5)*D*.4); roomGroup.add(p1);
+  const p2 = new THREE.PointLight(pal.accent.getHex(), 10, 0, 2);
+  p2.position.set((rng()-.5)*W*.4, 1.2, (rng()-.5)*D*.4); roomGroup.add(p2);
+
+  // ---- store room state for movement / collision
+  ROOM = { halfW, halfD, H, doors, pal, p1, t0:0 };
+
+  // place player just inside the +z (entry) wall, facing -z (toward far door)
+  camera.position.set(0, 1.6, halfD - 1.5);
+  controls.getObject().rotation.set(0,0,0);
+  camera.rotation.set(0,0,0);
+
+  // HUD
+  document.getElementById('depth').textContent = String(depth).padStart(3,'0');
+  document.getElementById('palname').textContent = pal.name;
+  whoosh(pal);
+}
+
+// ---- movement + collision + door crossing --------------------------
+let transitioning = false;
+const fadeEl = document.getElementById('fade');
+
+function constrain(){
+  if(!ROOM || transitioning) return;
+  const p = camera.position, r = 0.6, cross = 0.6;
+  const { halfW, halfD, doors } = ROOM;
+  const doorAt = (wall, coord) => doors.find(d=> d.wall===wall && Math.abs(coord-d.center) < DOOR_W/2 - 0.2);
+
+  // +x / -x walls
+  if(p.x >  halfW - r){ const d=doorAt('+x',p.z); if(d){ if(p.x> halfW+cross) return go(d);} else p.x= halfW-r; }
+  if(p.x < -halfW + r){ const d=doorAt('-x',p.z); if(d){ if(p.x<-halfW-cross) return go(d);} else p.x=-halfW+r; }
+  // -z (far) / +z (entry, never a door) walls
+  if(p.z < -halfD + r){ const d=doorAt('-z',p.x); if(d){ if(p.z<-halfD-cross) return go(d);} else p.z=-halfD+r; }
+  if(p.z >  halfD - r){ p.z = halfD - r; }
+}
+
+function go(door){
+  transitioning = true;
+  fadeEl.classList.add('on');
+  whoosh(ROOM.pal, true);
+  setTimeout(()=>{
+    depth++;
+    seed = (hashStr(seed + ':' + door.wall + ':' + Math.round(door.center*10)) ^ (depth*2654435761)) >>> 0;
+    buildRoom(seed);
+    fadeEl.classList.remove('on');
+    setTimeout(()=> transitioning=false, 250);
+  }, 560);
+}
+
+// ---- ambient audio (web audio drone) -------------------------------
+let actx, master, droneNodes=[];
+function initAudio(){
+  if(actx) return;
+  try{ actx = new (window.AudioContext||window.webkitAudioContext)(); }catch(_){ return; }
+  master = actx.createGain(); master.gain.value = 0.0; master.connect(actx.destination);
+  const lp = actx.createBiquadFilter(); lp.type='lowpass'; lp.frequency.value=600; lp.connect(master);
+  [55, 82.5, 110, 164.8].forEach((f,i)=>{
+    const o = actx.createOscillator(); o.type = i%2?'sine':'triangle';
+    o.frequency.value = f * (1 + (i*0.003));
+    const g = actx.createGain(); g.gain.value = 0.18/(i+1);
+    o.connect(g); g.connect(lp); o.start(); droneNodes.push({o,g});
+  });
+  // slow filter LFO for movement
+  const lfo = actx.createOscillator(); lfo.frequency.value = 0.05;
+  const lg = actx.createGain(); lg.gain.value = 280; lfo.connect(lg); lg.connect(lp.frequency); lfo.start();
+  master.gain.linearRampToValueAtTime(0.5, actx.currentTime + 4);
+}
+function resumeAudio(){ if(actx && actx.state==='suspended') actx.resume(); }
+function whoosh(pal, hard){
+  if(!actx) return;
+  const o=actx.createOscillator(), g=actx.createGain();
+  o.type='sine'; o.frequency.setValueAtTime(hard?420:240, actx.currentTime);
+  o.frequency.exponentialRampToValueAtTime(60, actx.currentTime + (hard?0.6:0.4));
+  g.gain.setValueAtTime(0.0001, actx.currentTime);
+  g.gain.linearRampToValueAtTime(hard?0.25:0.12, actx.currentTime+0.04);
+  g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + (hard?0.7:0.5));
+  o.connect(g); g.connect(master||actx.destination); o.start(); o.stop(actx.currentTime+0.8);
+}
+
+// ---- main loop ------------------------------------------------------
+let bobT = 0;
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  if(controls.isLocked && !transitioning){
+    const speed = 4.6;
+    const f = (keys.KeyW||keys.ArrowUp?1:0) - (keys.KeyS||keys.ArrowDown?1:0);
+    const s = (keys.KeyD||keys.ArrowRight?1:0) - (keys.KeyA||keys.ArrowLeft?1:0);
+    if(s) controls.moveRight(s*speed*dt);
+    if(f) controls.moveForward(f*speed*dt);
+    constrain();
+    // head-bob
+    if(f||s){ bobT += dt*9; }
+    camera.position.y = 1.6 + Math.sin(bobT)*0.045 + Math.sin(t*0.7)*0.01;
+  }
+
+  // animate dream objects + drifting light
+  if(roomGroup){
+    roomGroup.traverse(o=>{
+      if(o.userData.spin){ o.rotation.x+=o.userData.spin.x*dt; o.rotation.y+=o.userData.spin.y*dt; o.rotation.z+=o.userData.spin.z*dt;
+        const b=o.userData.bob; o.position.y = b.base + Math.sin(t*0.8+b.ph)*b.amp; }
+      if(o.userData.portal){ o.material.opacity = 0.16 + Math.sin(t*1.6)*0.1; }
+    });
+    if(ROOM && ROOM.p1){ ROOM.p1.intensity *= 1; }
+  }
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
